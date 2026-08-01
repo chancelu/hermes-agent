@@ -3299,6 +3299,138 @@ def _skill_meta_to_dict(meta: SkillMeta) -> dict:
 # Lock file management
 # ---------------------------------------------------------------------------
 
+@dataclass
+class SkillDependency:
+    """One entry of a skill's ``depends_on`` front-matter list."""
+
+    name: str
+    required: bool = True
+    reason: str = ""
+
+
+def parse_skill_dependencies(frontmatter: dict) -> List[SkillDependency]:
+    """Read ``depends_on`` from SKILL.md front-matter.
+
+    Two spellings are accepted so a one-line declaration stays cheap::
+
+        depends_on: [obsidian, kanban]          # all required
+
+        depends_on:
+          - name: obsidian
+            required: true
+            reason: "reads from Obsidian vaults"
+          - name: kanban
+            required: false
+
+    Anything malformed is skipped rather than raising: a bad ``depends_on``
+    must not make an otherwise installable skill uninstallable.
+    """
+    raw = frontmatter.get("depends_on")
+    if not raw:
+        return []
+    if isinstance(raw, (str, bytes)):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+
+    out: List[SkillDependency] = []
+    seen: set = set()
+    for item in raw:
+        if isinstance(item, str):
+            name, required, reason = item.strip(), True, ""
+        elif isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+            required = bool(item.get("required", True))
+            reason = str(item.get("reason") or "").strip()
+        else:
+            continue
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(SkillDependency(name=name, required=required, reason=reason))
+    return out
+
+
+def installed_skill_names() -> set:
+    """Every name under which a skill is reachable, matching runtime discovery.
+
+    The gate must agree with what the agent can actually load, or it blocks a
+    dependency the user genuinely has. Three sources, all of which runtime
+    discovery honours:
+
+    * the hub lockfile (hub installs);
+    * every root in ``get_all_skills_dirs()`` -- the local skills dir *and* the
+      configured ``skills.external_dirs`` -- since a skill supplied from an
+      external root is as usable as one in the profile;
+    * both the declared ``name:`` and the directory name for each SKILL.md.
+      ``tools/skills_tool.py`` resolves a skill as
+      ``frontmatter.get("name", skill_dir.name)``, so a hand-placed skill in a
+      differently-named directory is usable under its declared name;
+      ``tools/skills_sync.py`` indexes both forms for the same reason.
+    """
+    names: set = set()
+    try:
+        for entry in HubLockFile().list_installed():
+            nm = str(entry.get("name") or "").strip()
+            if nm:
+                names.add(nm)
+    except Exception:
+        pass
+
+    try:
+        from agent.skill_utils import get_all_skills_dirs
+
+        roots = list(get_all_skills_dirs())
+    except Exception:
+        roots = [_skills_dir()]
+
+    for root in roots:
+        try:
+            for skill_md in Path(root).rglob("SKILL.md"):
+                parent = skill_md.parent
+                if any(part.startswith(".") for part in parent.parts):
+                    continue
+                names.add(parent.name)
+                declared = _declared_skill_name(skill_md)
+                if declared:
+                    names.add(declared)
+        except Exception:
+            continue
+    return names
+
+
+def _declared_skill_name(skill_md: "Path") -> str:
+    """Return a SKILL.md's front-matter ``name:``, or "" when unreadable."""
+    try:
+        head = skill_md.read_text(encoding="utf-8", errors="replace")[:4000]
+    except Exception:
+        return ""
+    head = head.lstrip("\ufeff")
+    if not head.startswith("---"):
+        return ""
+    match = re.search(r"\n---\s*\n", head[3:])
+    if not match:
+        return ""
+    try:
+        parsed = yaml.safe_load(head[3:match.start() + 3])
+    except Exception:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    return str(parsed.get("name") or "").strip()
+
+
+def resolve_skill_dependencies(
+    deps: List[SkillDependency],
+    installed: Optional[set] = None,
+) -> Tuple[List[SkillDependency], List[SkillDependency]]:
+    """Split *deps* into (missing_required, missing_optional)."""
+    have = installed_skill_names() if installed is None else installed
+    missing_required = [d for d in deps if d.required and d.name not in have]
+    missing_optional = [d for d in deps if not d.required and d.name not in have]
+    return missing_required, missing_optional
+
+
 class HubLockFile:
     """Manages skills/.hub/lock.json — tracks provenance of installed hub skills."""
 

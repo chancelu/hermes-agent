@@ -38,6 +38,12 @@ SKILL.md Format (YAML Frontmatter, agentskills.io compatible):
       env_vars: [API_KEY]         #   Legacy env var names are normalized into
                                   #   required_environment_variables on load.
       commands: [curl, jq]        #   Command checks remain advisory only.
+    depends_on:                   # Optional — other SKILLS this one needs.
+      - name: obsidian            #   Enforced by `hermes skill install`:
+        required: true            #   a missing required dep blocks the install
+        reason: "reads vaults"    #   (use --force to override); a missing
+      - name: kanban              #   optional dep warns and proceeds.
+        required: false           #   Shorthand: depends_on: [obsidian, kanban]
     compatibility: Requires X     # Optional (agentskills.io)
     metadata:                     # Optional, arbitrary key-value (agentskills.io)
       hermes:

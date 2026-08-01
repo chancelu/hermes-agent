@@ -499,6 +499,84 @@ def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
             "'hermes skills search <query>' to search deeper[/]\n")
 
 
+def _check_skill_dependencies(bundle, c: Console, *, force: bool = False) -> bool:
+    """Enforce a skill's ``depends_on`` list. Returns True when install must stop.
+
+    ``prerequisites`` (env vars, commands) and ``related_skills`` (advisory)
+    already exist, but neither expresses "this skill does not work without
+    that one", and nothing was enforced at install time. A skill that drives
+    another skill's commands could be installed alone and would only fail once
+    the agent tried to use it.
+
+    Required dependencies block; optional ones warn and proceed. ``--force``
+    downgrades a block to a warning, matching how it already overrides the
+    security verdict — the user has said they know what they are doing.
+    """
+    from tools.skills_hub import parse_skill_dependencies, resolve_skill_dependencies
+
+    skill_md = (getattr(bundle, "files", None) or {}).get("SKILL.md")
+    if not skill_md:
+        return False
+    try:
+        from tools.skills_hub import SourceAdapter  # noqa: F401  (frontmatter parser lives on it)
+    except Exception:
+        pass
+    try:
+        import yaml as _yaml
+
+        text = skill_md.decode("utf-8", "replace") if isinstance(skill_md, bytes) else str(skill_md)
+        text = text.lstrip("\ufeff")
+        frontmatter = {}
+        if text.startswith("---"):
+            import re as _re
+
+            m = _re.search(r"\n---\s*\n", text[3:])
+            if m:
+                parsed = _yaml.safe_load(text[3:m.start() + 3])
+                if isinstance(parsed, dict):
+                    frontmatter = parsed
+    except Exception:
+        return False
+
+    deps = parse_skill_dependencies(frontmatter)
+    if not deps:
+        return False
+
+    missing_required, missing_optional = resolve_skill_dependencies(deps)
+
+    for dep in missing_optional:
+        why = f" — {dep.reason}" if dep.reason else ""
+        c.print(
+            f"[yellow]Optional dependency not installed:[/] '{dep.name}'{why}\n"
+            f"[dim]  '{bundle.name}' will work with reduced functionality. "
+            f"Install it with: hermes skill install {dep.name}[/]"
+        )
+
+    if not missing_required:
+        return False
+
+    lines = []
+    for dep in missing_required:
+        why = f" — {dep.reason}" if dep.reason else ""
+        lines.append(f"  • {dep.name}{why}")
+    names = " ".join(d.name for d in missing_required)
+    detail = "\n".join(lines)
+
+    if force:
+        c.print(
+            f"[yellow]Missing required dependencies (installing anyway, --force):[/]\n{detail}"
+        )
+        return False
+
+    c.print(
+        f"\n[bold red]Installation blocked:[/] '{bundle.name}' requires "
+        f"{len(missing_required)} skill(s) that are not installed:\n{detail}\n\n"
+        f"[dim]Install them first:  hermes skill install {names}\n"
+        f"Or bypass this check:  hermes skill install {bundle.name} --force[/]\n"
+    )
+    return True
+
+
 def do_install(identifier: str, category: str = "", force: bool = False,
                console: Optional[Console] = None, skip_confirm: bool = False,
                invalidate_cache: bool = True,
@@ -698,6 +776,15 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         append_audit_log("BLOCKED", bundle.name, bundle.source,
                          bundle.trust_level, result.verdict,
                          f"{len(result.findings)}_findings")
+        return
+
+    # ── depends_on enforcement (#71853) ───────────────────────────────
+    # Runs after the security verdict and before the confirm prompt, so a
+    # blocked install never reaches the "Install 'x'?" question and the user
+    # is told what to install first rather than discovering it at runtime.
+    dep_error = _check_skill_dependencies(bundle, c, force=force)
+    if dep_error:
+        shutil.rmtree(q_path, ignore_errors=True)
         return
 
     if extra_metadata:

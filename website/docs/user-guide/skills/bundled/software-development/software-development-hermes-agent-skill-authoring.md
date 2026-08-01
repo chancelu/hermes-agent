@@ -72,6 +72,7 @@ metadata:
   hermes:
     tags: [short, descriptive, tags]
     related_skills: [other-skill, another-skill]
+depends_on: [other-skill]           # skills this one cannot work without
 ---
 ```
 
