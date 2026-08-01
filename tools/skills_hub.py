@@ -3420,14 +3420,51 @@ def _declared_skill_name(skill_md: "Path") -> str:
     return str(parsed.get("name") or "").strip()
 
 
+def read_skill_frontmatter(skill_md: Union[str, bytes, "Path"]) -> dict:
+    """Extract YAML frontmatter from a SKILL.md file, path, or raw text.
+
+    Returns an empty dict when the input is unreadable or has no frontmatter.
+    """
+    try:
+        if isinstance(skill_md, (str, bytes)):
+            text = skill_md.decode("utf-8", "replace") if isinstance(skill_md, bytes) else str(skill_md)
+        else:
+            text = skill_md.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return {}
+
+    text = text.lstrip("\ufeff")
+    if not text.startswith("---"):
+        return {}
+    match = re.search(r"\n---\s*\n", text[3:])
+    if not match:
+        return {}
+    try:
+        parsed = yaml.safe_load(text[3:match.start() + 3])
+    except Exception:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return parsed
+
+
 def resolve_skill_dependencies(
     deps: List[SkillDependency],
     installed: Optional[set] = None,
+    *,
+    with_optional: bool = False,
 ) -> Tuple[List[SkillDependency], List[SkillDependency]]:
-    """Split *deps* into (missing_required, missing_optional)."""
+    """Split *deps* into (missing_required, missing_optional).
+
+    When *with_optional* is True, optional dependencies are treated as
+    required for the purpose of the gate (used by ``--with-optional``).
+    """
     have = installed_skill_names() if installed is None else installed
     missing_required = [d for d in deps if d.required and d.name not in have]
     missing_optional = [d for d in deps if not d.required and d.name not in have]
+    if with_optional:
+        missing_required = missing_required + missing_optional
+        missing_optional = []
     return missing_required, missing_optional
 
 

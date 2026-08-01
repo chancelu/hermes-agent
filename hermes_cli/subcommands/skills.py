@@ -102,6 +102,11 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
         "--force", action="store_true", help="Install despite blocked scan verdict"
     )
     skills_install.add_argument(
+        "--with-optional",
+        action="store_true",
+        help="Also install optional dependencies (treats them as required)",
+    )
+    skills_install.add_argument(
         "--yes",
         "-y",
         action="store_true",

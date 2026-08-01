@@ -14,7 +14,7 @@ import json
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from rich.console import Console
 from rich.panel import Panel
@@ -499,8 +499,18 @@ def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
             "'hermes skills search <query>' to search deeper[/]\n")
 
 
-def _check_skill_dependencies(bundle, c: Console, *, force: bool = False) -> bool:
-    """Enforce a skill's ``depends_on`` list. Returns True when install must stop.
+def _check_skill_dependencies(
+    bundle,
+    c: Console,
+    *,
+    force: bool = False,
+    with_optional: bool = False,
+    skip_confirm: bool = False,
+    sources=None,
+) -> Tuple[bool, List[str]]:
+    """Enforce a skill's ``depends_on`` list with transitive resolution.
+
+    Returns (should_stop, missing_names).
 
     ``prerequisites`` (env vars, commands) and ``related_skills`` (advisory)
     already exist, but neither expresses "this skill does not work without
@@ -508,43 +518,67 @@ def _check_skill_dependencies(bundle, c: Console, *, force: bool = False) -> boo
     another skill's commands could be installed alone and would only fail once
     the agent tried to use it.
 
-    Required dependencies block; optional ones warn and proceed. ``--force``
-    downgrades a block to a warning, matching how it already overrides the
-    security verdict — the user has said they know what they are doing.
+    Required dependencies block; optional ones warn and proceed unless
+    ``with_optional`` is True. ``--force`` downgrades a block to a warning,
+    matching how it already overrides the security verdict.
+
+    Transitive resolution: if skill A depends on B and B depends on C,
+    installing A will report both B and C as missing (in topological order).
     """
-    from tools.skills_hub import parse_skill_dependencies, resolve_skill_dependencies
+    from tools.skills_hub import (
+        parse_skill_dependencies,
+        resolve_skill_dependencies,
+        read_skill_frontmatter,
+        installed_skill_names,
+    )
 
     skill_md = (getattr(bundle, "files", None) or {}).get("SKILL.md")
     if not skill_md:
-        return False
-    try:
-        from tools.skills_hub import SourceAdapter  # noqa: F401  (frontmatter parser lives on it)
-    except Exception:
-        pass
-    try:
-        import yaml as _yaml
+        return False, []
 
-        text = skill_md.decode("utf-8", "replace") if isinstance(skill_md, bytes) else str(skill_md)
-        text = text.lstrip("\ufeff")
-        frontmatter = {}
-        if text.startswith("---"):
-            import re as _re
-
-            m = _re.search(r"\n---\s*\n", text[3:])
-            if m:
-                parsed = _yaml.safe_load(text[3:m.start() + 3])
-                if isinstance(parsed, dict):
-                    frontmatter = parsed
-    except Exception:
-        return False
-
+    frontmatter = read_skill_frontmatter(skill_md)
     deps = parse_skill_dependencies(frontmatter)
     if not deps:
-        return False
+        return False, []
 
-    missing_required, missing_optional = resolve_skill_dependencies(deps)
+    # ── transitive resolution ──────────────────────────────────────────
+    installed = installed_skill_names()
+    all_missing_required: List = []
+    all_missing_optional: List = []
+    cycles: List[str] = []
+    _resolve_transitive(
+        bundle.name,
+        deps,
+        installed,
+        all_missing_required,
+        all_missing_optional,
+        cycles,
+        _visited={bundle.name},
+        _path=[bundle.name],
+        sources=sources,
+    )
 
-    for dep in missing_optional:
+    # Deduplicate while preserving topological order (deps first)
+    seen_req = set()
+    deduped_req = []
+    for d in all_missing_required:
+        if d.name not in seen_req:
+            seen_req.add(d.name)
+            deduped_req.append(d)
+
+    seen_opt = set()
+    deduped_opt = []
+    for d in all_missing_optional:
+        if d.name not in seen_opt and d.name not in seen_req:
+            seen_opt.add(d.name)
+            deduped_opt.append(d)
+
+    if with_optional:
+        deduped_req = deduped_req + deduped_opt
+        deduped_opt = []
+
+    # ── optional warnings ──────────────────────────────────────────────
+    for dep in deduped_opt:
         why = f" — {dep.reason}" if dep.reason else ""
         c.print(
             f"[yellow]Optional dependency not installed:[/] '{dep.name}'{why}\n"
@@ -552,36 +586,143 @@ def _check_skill_dependencies(bundle, c: Console, *, force: bool = False) -> boo
             f"Install it with: hermes skill install {dep.name}[/]"
         )
 
-    if not missing_required:
-        return False
+    # ── cycle reporting ────────────────────────────────────────────────
+    for cycle in cycles:
+        c.print(f"[yellow]Circular dependency detected:[/] {cycle}")
+
+    # ── required blocking ──────────────────────────────────────────────
+    if not deduped_req:
+        return False, []
 
     lines = []
-    for dep in missing_required:
+    for dep in deduped_req:
         why = f" — {dep.reason}" if dep.reason else ""
         lines.append(f"  • {dep.name}{why}")
-    names = " ".join(d.name for d in missing_required)
+    names = " ".join(d.name for d in deduped_req)
     detail = "\n".join(lines)
 
     if force:
         c.print(
             f"[yellow]Missing required dependencies (installing anyway, --force):[/]\n{detail}"
         )
-        return False
+        return False, [d.name for d in deduped_req]
 
     c.print(
         f"\n[bold red]Installation blocked:[/] '{bundle.name}' requires "
-        f"{len(missing_required)} skill(s) that are not installed:\n{detail}\n\n"
+        f"{len(deduped_req)} skill(s) that are not installed:\n{detail}\n\n"
         f"[dim]Install them first:  hermes skill install {names}\n"
         f"Or bypass this check:  hermes skill install {bundle.name} --force[/]\n"
     )
-    return True
+    return True, [d.name for d in deduped_req]
+
+
+def _resolve_transitive(
+    skill_name: str,
+    deps,
+    installed: set,
+    out_required: List,
+    out_optional: List,
+    out_cycles: List[str],
+    *,
+    _visited: set,
+    _path: List[str],
+    sources=None,
+    max_depth: int = 10,
+):
+    """Recursively walk the dependency graph.
+
+    For each missing dependency, attempts to discover its own dependencies:
+    * installed skills → read SKILL.md from disk
+    * missing skills  → attempt source lookup (best-effort; no network = skip)
+    """
+    from tools.skills_hub import resolve_skill_dependencies
+
+    if len(_path) > max_depth:
+        out_cycles.append(f"{' → '.join(_path)} (max depth {max_depth} exceeded)")
+        return
+
+    req, opt = resolve_skill_dependencies(deps, installed=installed)
+    out_required.extend(req)
+    out_optional.extend(opt)
+
+    for dep in req + opt:
+        if dep.name in _visited:
+            cycle = " → ".join(_path + [dep.name])
+            if cycle not in out_cycles:
+                out_cycles.append(cycle)
+            continue
+
+        # Try to read the dependency's own SKILL.md
+        child_deps = _load_dependency_deps(dep.name, installed, sources=sources)
+        if child_deps:
+            _resolve_transitive(
+                dep.name,
+                child_deps,
+                installed,
+                out_required,
+                out_optional,
+                out_cycles,
+                _visited=_visited | {dep.name},
+                _path=_path + [dep.name],
+                sources=sources,
+                max_depth=max_depth,
+            )
+
+
+def _load_dependency_deps(dep_name: str, installed: set, *, sources=None):
+    """Return the ``depends_on`` list for a skill, or None if unreachable.
+
+    Tries, in order:
+    1. Read from a skill's SKILL.md on disk (installed or hand-placed).
+    2. (best-effort) Fetch from available sources when ``sources`` is passed.
+    """
+    from tools.skills_hub import parse_skill_dependencies, read_skill_frontmatter
+
+    # 1. Skill on disk (search all skill roots, not just installed)
+    try:
+        from agent.skill_utils import get_all_skills_dirs
+
+        roots = list(get_all_skills_dirs())
+    except Exception:
+        from tools.skills_hub import _skills_dir
+
+        roots = [_skills_dir()]
+
+    for root in roots:
+        try:
+            for skill_md in Path(root).rglob("SKILL.md"):
+                parent = skill_md.parent
+                if any(part.startswith(".") for part in parent.parts):
+                    continue
+                declared = read_skill_frontmatter(skill_md).get("name", "").strip()
+                if parent.name == dep_name or declared == dep_name:
+                    fm = read_skill_frontmatter(skill_md)
+                    return parse_skill_dependencies(fm)
+        except Exception:
+            continue
+
+    # 2. Source lookup (best-effort — network may be unavailable)
+    if sources is not None:
+        try:
+            meta, child_bundle, _ = _resolve_source_meta_and_bundle(dep_name, sources)
+            if child_bundle and getattr(child_bundle, "files", None):
+                skill_md = child_bundle.files.get("SKILL.md")
+                if skill_md:
+                    fm = read_skill_frontmatter(skill_md)
+                    return parse_skill_dependencies(fm)
+        except Exception:
+            pass
+
+    return None
 
 
 def do_install(identifier: str, category: str = "", force: bool = False,
                console: Optional[Console] = None, skip_confirm: bool = False,
                invalidate_cache: bool = True,
                name_override: str = "",
-               source_id: Optional[str] = None) -> None:
+               source_id: Optional[str] = None,
+               with_optional: bool = False,
+               auto_install: bool = False) -> None:
     """Fetch, quarantine, scan, confirm, and install a skill.
 
     ``name_override`` lets non-interactive callers (slash commands, gateway,
@@ -597,6 +738,13 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     identifier cannot be fuzzy-resolved to a same-named skill in a different
     registry. Skill names are not namespaced across registries, so an
     unconstrained resolve can silently change a skill's provenance.
+
+    ``with_optional`` treats optional dependencies as required, installing
+    them together with the main skill.
+
+    ``auto_install`` (non-interactive only) automatically installs missing
+    transitive dependencies after the security scan passes, in topological
+    order (deepest dependencies first).
     """
     from tools.skills_hub import (
         GitHubAuth, create_source_router, ensure_hub_dirs,
@@ -782,10 +930,48 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     # Runs after the security verdict and before the confirm prompt, so a
     # blocked install never reaches the "Install 'x'?" question and the user
     # is told what to install first rather than discovering it at runtime.
-    dep_error = _check_skill_dependencies(bundle, c, force=force)
-    if dep_error:
+    dep_error, missing_deps = _check_skill_dependencies(
+        bundle, c, force=force, with_optional=with_optional,
+        skip_confirm=skip_confirm, sources=sources,
+    )
+    if dep_error and not auto_install:
         shutil.rmtree(q_path, ignore_errors=True)
         return
+
+    # ── auto-install missing transitive dependencies ──────────────────
+    # Non-interactive callers (slash commands, gateway) can pass
+    # auto_install=True to automatically satisfy dependencies in
+    # topological order (deepest first).  Each dependency goes through
+    # the same quarantine → scan → install flow as the parent skill.
+    if missing_deps and auto_install:
+        c.print(f"\n[bold]Auto-installing {len(missing_deps)} missing dependenc(ies)...[/]")
+        for dep_name in missing_deps:
+            c.print(f"[dim]  → {dep_name}[/]")
+            do_install(
+                dep_name,
+                force=force,
+                console=c,
+                skip_confirm=True,
+                invalidate_cache=False,
+                with_optional=with_optional,
+                auto_install=True,
+            )
+        # Refresh installed set after auto-install attempts
+        from tools.skills_hub import installed_skill_names
+        still_missing = [d for d in missing_deps if d not in installed_skill_names()]
+        if still_missing:
+            c.print(
+                f"\n[bold red]Auto-install incomplete:[/] "
+                f"{len(still_missing)} dependenc(ies) could not be installed: "
+                f"{' '.join(still_missing)}"
+            )
+            shutil.rmtree(q_path, ignore_errors=True)
+            return
+        c.print(f"[bold green]All dependencies satisfied.[/]\n")
+
+    if dep_error and not missing_deps:
+        # Edge case: --force cleared the error but there are no deps to auto-install
+        pass  # proceed
 
     if extra_metadata:
         metadata_lines = _format_extra_metadata_lines(extra_metadata)
@@ -1832,6 +2018,7 @@ def skills_command(args) -> None:
                   as_json=getattr(args, "json", False))
     elif action == "install":
         do_install(args.identifier, category=args.category, force=args.force,
+                   with_optional=getattr(args, "with_optional", False),
                    skip_confirm=getattr(args, "yes", False),
                    name_override=getattr(args, "name", "") or "")
     elif action == "inspect":
@@ -1996,6 +2183,7 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
         # Always skip confirmation — the user typing the command is implicit consent.
         skip_confirm = True
         force = "--force" in args
+        with_optional = "--with-optional" in args
         # --now invalidates prompt cache immediately (costs more money).
         # Default: defer to next session to preserve cache.
         invalidate_cache = "--now" in args
@@ -2005,6 +2193,7 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
             elif a == "--name" and i + 1 < len(args):
                 name_override = args[i + 1]
         do_install(identifier, category=category, force=force,
+                   with_optional=with_optional,
                    skip_confirm=skip_confirm, invalidate_cache=invalidate_cache,
                    name_override=name_override, console=c)
 
@@ -2118,6 +2307,7 @@ def _print_skills_help(console: Console) -> None:
         "  [cyan]browse[/] [--source official]   Browse all available skills (paginated)\n"
         "  [cyan]search[/] <query>              Search registries for skills\n"
         "  [cyan]install[/] <identifier>        Install a skill (with security scan)\n"
+        "       [--with-optional]            Also install optional dependencies\n"
         "  [cyan]inspect[/] <identifier>        Preview a skill without installing\n"
         "  [cyan]list[/] [--source hub|builtin|local] [--enabled-only]\n"
         "       List installed skills; --enabled-only filters to the active profile's live set\n"
